@@ -1,0 +1,3 @@
+include openspindlenet/models/*.onnx
+include openspindlenet/data/*.txt
+include README.md
