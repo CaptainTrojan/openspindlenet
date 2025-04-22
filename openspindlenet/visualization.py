@@ -15,14 +15,33 @@ def visualize_spindles(signal: np.ndarray,
     Args:
         signal: The raw EEG signal
         intervals: The detected spindle intervals (start, end, confidence)
+        segmentation: Binary array marking spindle locations
         output_path: Path to save the PDF visualization (optional)
         
     Returns:
         The matplotlib figure object
     """
+    # For empty intervals, create a simple plot of the signal
     if len(intervals) == 0:
-        print("No spindles detected, skipping visualization")
-        return None
+        fig = plt.figure(figsize=(12, 6))
+        plt.plot(signal, color='gray', linewidth=0.8)
+        plt.title("No spindles detected in signal", fontsize=14)
+        plt.axis('off')
+        
+        # Save to PDF if output path is provided
+        if output_path:
+            # Ensure directory exists
+            output_dir = os.path.dirname(os.path.abspath(output_path))
+            if output_dir:  # Only create if there's an actual directory part
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # Save to PDF
+            with PdfPages(output_path) as pdf:
+                pdf.savefig(fig, bbox_inches='tight')
+            
+            print(f"Visualization saved to {os.path.abspath(output_path)}")
+        
+        return fig
         
     # Sort intervals by start position (chronological order)
     sorted_intervals = sorted(intervals, key=lambda x: x[0])
@@ -41,7 +60,14 @@ def visualize_spindles(signal: np.ndarray,
     ax_full.plot(signal, color='gray', alpha=0.5, linewidth=0.8)
     
     # Highlight each spindle with higher alpha and thickness
-    for i, (start, end, conf) in enumerate(sorted_intervals):
+    for i, interval in enumerate(sorted_intervals):
+        # Handle cases where interval might be just [start, end] without confidence
+        if len(interval) >= 3:
+            start, end, conf = interval[0], interval[1], interval[2]
+        else:
+            start, end = interval[0], interval[1]
+            conf = 0.5  # Default confidence if not provided
+            
         start_idx, end_idx = int(start), int(end)
         ax_full.plot(range(start_idx, end_idx + 1), 
                      signal[start_idx:end_idx + 1], 
@@ -61,7 +87,8 @@ def visualize_spindles(signal: np.ndarray,
     ax_seg = plt.subplot(gs[1])
     ax_seg.plot(segmentation, color='blue', linewidth=1.5)
     # Add spindle numbers
-    for i, (start, end, _) in enumerate(sorted_intervals):
+    for i, interval in enumerate(sorted_intervals):
+        start, end = interval[0], interval[1]
         mid_point = int((start + end) // 2)
         ax_seg.text(mid_point, 1.1, f"{i+1}", fontsize=12, ha='center', va='center')
     
@@ -69,7 +96,14 @@ def visualize_spindles(signal: np.ndarray,
     ax_seg.axis('off')
     
     # Plots 3+: Zoomed-in spindles
-    for i, (start, end, conf) in enumerate(sorted_intervals):
+    for i, interval in enumerate(sorted_intervals):
+        # Handle cases where interval might be just [start, end] without confidence
+        if len(interval) >= 3:
+            start, end, conf = interval[0], interval[1], interval[2]
+        else:
+            start, end = interval[0], interval[1]
+            conf = 0.5  # Default confidence if not provided
+            
         start_idx, end_idx = int(start), int(end)
         
         # Add padding for better visibility (10% on each side)
@@ -98,7 +132,9 @@ def visualize_spindles(signal: np.ndarray,
     # Save to PDF if output path is provided
     if output_path:
         # Ensure directory exists
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        if output_dir:  # Only create if there's an actual directory part
+            os.makedirs(output_dir, exist_ok=True)
         
         # Save to PDF
         with PdfPages(output_path) as pdf:

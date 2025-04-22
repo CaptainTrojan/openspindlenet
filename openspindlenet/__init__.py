@@ -1,11 +1,9 @@
 import os
 import pkg_resources
 
-from .inference import detect_spindles, SpindleInference
-from .evaluator import Evaluator
-from .visualization import visualize_spindles
+from .inference import detect_spindles as detect
 
-# Define function to get paths to included models
+# Internal functions - not exposed directly
 def get_model_path(model_type="eeg"):
     """Get the path to a bundled model file.
     
@@ -23,7 +21,6 @@ def get_model_path(model_type="eeg"):
         f"models/spindle-detector-{model_type.lower()}.onnx"
     )
 
-# Define function to get paths to example data
 def get_example_data_path(data_type="eeg"):
     """Get the path to example data.
     
@@ -38,14 +35,7 @@ def get_example_data_path(data_type="eeg"):
         
     return pkg_resources.resource_filename(
         "openspindlenet", 
-        f"data/example_{data_type.lower()}.txt"
+        f"data/{data_type.lower()}_sample.txt"
     )
 
-__all__ = [
-    'detect_spindles', 
-    'SpindleInference', 
-    'Evaluator', 
-    'visualize_spindles',
-    'get_model_path',
-    'get_example_data_path'
-]
+__all__ = ['detect']

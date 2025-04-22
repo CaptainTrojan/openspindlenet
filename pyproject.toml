@@ -8,21 +8,29 @@ version = "0.1.0"
 description = "Open-source tool for sleep spindle detection using neural networks"
 readme = "README.md"
 authors = [
-    {name = "OpenSpindleNet Team", email = "author@example.com"},
+    {name = "Michal Seják", email = "michalsejak@gmail.com"},
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 dependencies = [
     "numpy>=1.19.0",
-    "matplotlib>=3.3.0",
     "onnxruntime>=1.7.0",
     "pywavelets>=1.1.0",
+]
+
+[project.optional-dependencies]
+cli = [
     "rich>=10.0.0",
-    "typer[all]>=0.9.0",  # Added Typer with all optional dependencies
+    "typer[all]>=0.9.0",
+    "matplotlib>=3.3.0",  # Required for visualization
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
 ]
 
 [project.urls]
