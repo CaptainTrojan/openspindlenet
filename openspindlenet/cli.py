@@ -225,8 +225,13 @@ else:
                 for i, interval in enumerate(intervals):
                     if len(interval) >= 2:  # Make sure we have at least start and end
                         start, end = interval[0], interval[1]
-                        console.print(f"  {i+1}. {start:.2f} - {end:.2f} (duration: {end-start:.2f}s)")
-            
+                        
+                        # Convert start and end to seconds from time indices
+                        start_sec = start / 250  # Assuming 250 Hz sampling rate
+                        end_sec = end / 250
+
+                        console.print(f"  {i+1}. {start_sec:.2f} - {end_sec:.2f} (duration: {end_sec-start_sec:.2f}s)")
+
             # Visualize if requested
             if visualize:
                 console.print("Generating visualization...")
