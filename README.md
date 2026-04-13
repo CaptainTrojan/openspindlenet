@@ -64,23 +64,6 @@ openspindlenet example --data-type eeg
 
 `eval` writes timestamped JSON and CSV metric outputs by default and, with `--visualize`, generates a PDF that includes predictions, labels, and metric summary.
 
-## DREAMS Repro Bundle
-
-The repository includes a reproducibility bundle under [dreams-bundle](dreams-bundle) with:
-
-- DREAMS test signals dumped into TXT files
-- matching TXT label files
-- README instructions for one-file CLI evaluation
-
-Main workflow:
-
-```bash
-cd dreams-bundle
-openspindlenet eval data/signals/test_000.txt data/labels/test_000.txt --visualize
-```
-
-Use `mayo_spindles/mayo_spindles/create_dreams_repro_bundle.py` to regenerate the TXT bundle from DREAMS_HDF5.
-
 ## Development
 
 ### Testing
