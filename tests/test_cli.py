@@ -181,7 +181,8 @@ def test_visualization_saving(sample_eeg_data_file, tmp_path):
     # Check if the output message correctly shows the path
     assert "Saved visualization to" in result.stdout
     # Using Path.name to just match the filename part since paths might differ
-    assert vis_path.name in result.stdout
+    normalized_stdout = re.sub(r"\s+", "", result.stdout)
+    assert vis_path.name in normalized_stdout
 
 @skip_if_no_cli_deps
 def test_example_visualization_saving(tmp_path):
@@ -207,4 +208,5 @@ def test_example_visualization_saving(tmp_path):
     # Check if the output message correctly shows the path
     assert "Saved visualization to" in result.stdout
     # Using Path.name to just match the filename part since paths might differ
-    assert vis_path.name in result.stdout
+    normalized_stdout = re.sub(r"\s+", "", result.stdout)
+    assert vis_path.name in normalized_stdout
