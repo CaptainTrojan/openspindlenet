@@ -24,7 +24,8 @@ class SpindleInference:
 
     def __convert_to_scalogram(self, data: np.ndarray):
         """Convert the raw data to a scalogram using CWT."""
-        coeffs, frequencies = pywt.cwt(data, np.geomspace(150, 350, num=15), 'shan6-13', sampling_period=1/250)
+        # Matches the preprocessing used to generate HDF5 datasets in mayo_spindles.
+        coeffs, frequencies = pywt.cwt(data, np.geomspace(135, 270, num=15), 'shan6-13', sampling_period=1/250)
         return np.abs(coeffs)
     
     def __sigmoid(self, x):
@@ -51,6 +52,30 @@ class SpindleInference:
             raise ValueError(f"Expected 7500 values, but got {len(data)}")
                 
         return data
+
+    def load_labels(self, file_path_or_array: Union[str, np.ndarray]) -> np.ndarray:
+        """Load binary segmentation labels from a text file or numpy array."""
+        if isinstance(file_path_or_array, str):
+            try:
+                with open(file_path_or_array, 'r') as f:
+                    labels = np.array([float(x) for x in f.read().strip().split('\n')], dtype=np.float32)
+            except Exception as e:
+                raise IOError(f"Error loading labels from file: {e}")
+        elif isinstance(file_path_or_array, np.ndarray):
+            labels = file_path_or_array.astype(np.float32)
+        else:
+            raise TypeError(f"Expected labels path (str) or numpy array, got {type(file_path_or_array)}")
+
+        if labels.ndim > 2:
+            raise ValueError(f"Expected labels to be 1D or 2D, got shape {labels.shape}")
+        if labels.ndim == 2 and labels.shape[1] != 1:
+            raise ValueError(f"Expected labels shape [N] or [N,1], got {labels.shape}")
+        if labels.ndim == 2:
+            labels = labels[:, 0]
+        if len(labels) != 7500:
+            raise ValueError(f"Expected 7500 label values, but got {len(labels)}")
+
+        return labels
     
     def preprocess(self, data):
         """Preprocess the data by converting to scalogram and normalizing."""
@@ -84,7 +109,7 @@ class SpindleInference:
         
         return outputs
     
-    def postprocess(self, outputs):
+    def postprocess(self, outputs, confidence_threshold=0.5, nms_iou_threshold=0.3):
         """Apply post-processing to model outputs."""
         # Apply sigmoid to all outputs for post-processing
         processed_outputs = [self.__sigmoid(output) for output in outputs]
@@ -103,13 +128,13 @@ class SpindleInference:
             detections = output_dict['detection']
             # Process single sample
             seq_len = 7500  # Standard sequence length
-            intervals = Evaluator.detections_to_intervals(detections, seq_len, confidence_threshold=0.5)
-            nms_intervals = Evaluator.intervals_nms(intervals, iou_threshold=0.3)
+            intervals = Evaluator.detections_to_intervals(detections, seq_len, confidence_threshold=confidence_threshold)
+            nms_intervals = Evaluator.intervals_nms(intervals, iou_threshold=nms_iou_threshold)
             output_dict['detection_intervals'] = nms_intervals
         
         return processed_outputs, output_dict
     
-    def run(self, data: np.ndarray) -> Dict[str, Any]:
+    def run(self, data: np.ndarray, confidence_threshold=0.5, nms_iou_threshold=0.3) -> Dict[str, Any]:
         """Run the full inference pipeline."""
         # Preprocess data
         raw_signal, spectrogram = self.preprocess(data)
@@ -118,12 +143,21 @@ class SpindleInference:
         outputs = self.predict(raw_signal, spectrogram)
         
         # Post-process outputs
-        _, output_dict = self.postprocess(outputs)
+        _, output_dict = self.postprocess(outputs, confidence_threshold=confidence_threshold, nms_iou_threshold=nms_iou_threshold)
         
         return output_dict
 
 
-def detect_spindles(data_source: Union[str, np.ndarray], model_type: str = "eeg", custom_model_path: str = None) -> Dict[str, Any]:
+def detect_spindles(
+    data_source: Union[str, np.ndarray],
+    model_type: str = "eeg",
+    custom_model_path: str = None,
+    labels: Union[str, np.ndarray, None] = None,
+    confidence_threshold: float = 0.5,
+    nms_iou_threshold: float = 0.3,
+    match_iou_threshold: float = 0.3,
+    segmentation_threshold: float = 0.5,
+) -> Dict[str, Any]:
     """
     Detect spindles in EEG or iEEG data.
     
@@ -131,6 +165,11 @@ def detect_spindles(data_source: Union[str, np.ndarray], model_type: str = "eeg"
         data_source: Path to a text file or numpy array containing the signal
         model_type: Type of model to use ('eeg' or 'ieeg')
         custom_model_path: Path to a custom ONNX model file (overrides model_type)
+        labels: Optional segmentation labels ([7500] or [7500,1]) or path to labels txt
+        confidence_threshold: Detection confidence threshold
+        nms_iou_threshold: IoU threshold for detection NMS
+        match_iou_threshold: IoU threshold for one-to-one TP matching
+        segmentation_threshold: Threshold for segmentation metrics
         
     Returns:
         Dictionary containing detection results
@@ -150,9 +189,27 @@ def detect_spindles(data_source: Union[str, np.ndarray], model_type: str = "eeg"
     data = inference.load_data(data_source)
     
     # Run inference
-    results = inference.run(data)
+    results = inference.run(data, confidence_threshold=confidence_threshold, nms_iou_threshold=nms_iou_threshold)
     
     # Add the raw signal for visualization
     results['raw_signal'] = data
+
+    if labels is not None:
+        y_true = inference.load_labels(labels).reshape(-1, 1)
+        metrics = {
+            'detection': Evaluator.detection_metrics_from_arrays(
+                y_true_segmentation=y_true,
+                y_pred_detection=results['detection'],
+                confidence_threshold=confidence_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                match_iou_threshold=match_iou_threshold,
+            ),
+            'segmentation': Evaluator.segmentation_metrics_from_arrays(
+                y_true_segmentation=y_true,
+                y_pred_segmentation=results.get('segmentation', np.zeros_like(y_true, dtype=np.float32)),
+                threshold=segmentation_threshold,
+            ),
+        }
+        results['metrics'] = metrics
     
     return results

@@ -173,3 +173,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 pypi_token.txt
+
+# Dreams Bundle
+dreams-bundle/

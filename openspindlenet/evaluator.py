@@ -2,6 +2,103 @@ import numpy as np
 
 class Evaluator:
     @staticmethod
+    def _safe_prf(tp: int, fp: int, fn: int) -> dict:
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        return {
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        }
+
+    @staticmethod
+    def _interval_iou(a: np.ndarray, b: np.ndarray) -> float:
+        start_max = max(float(a[0]), float(b[0]))
+        end_min = min(float(a[1]), float(b[1]))
+        intersection = max(0.0, end_min - start_max)
+        union = (float(a[1]) - float(a[0])) + (float(b[1]) - float(b[0])) - intersection
+        return float(intersection / union) if union > 0 else 0.0
+
+    @staticmethod
+    def _match_intervals(pred_intervals: np.ndarray, true_intervals: np.ndarray, iou_threshold: float = 0.3) -> tuple[int, int, int]:
+        if len(pred_intervals) == 0 and len(true_intervals) == 0:
+            return 0, 0, 0
+        if len(pred_intervals) == 0:
+            return 0, 0, len(true_intervals)
+        if len(true_intervals) == 0:
+            return 0, len(pred_intervals), 0
+
+        unmatched_true = list(range(len(true_intervals)))
+        tp = 0
+        for pred in pred_intervals:
+            matched_idx = -1
+            for idx in unmatched_true:
+                iou = Evaluator._interval_iou(pred, true_intervals[idx])
+                if iou > iou_threshold:
+                    matched_idx = idx
+                    break
+            if matched_idx != -1:
+                tp += 1
+                unmatched_true.remove(matched_idx)
+
+        fp = len(pred_intervals) - tp
+        fn = len(true_intervals) - tp
+        return tp, fp, fn
+
+    @staticmethod
+    def detection_metrics_from_arrays(
+        y_true_segmentation: np.ndarray,
+        y_pred_detection: np.ndarray,
+        confidence_threshold: float = 0.5,
+        nms_iou_threshold: float = 0.3,
+        match_iou_threshold: float = 0.3,
+    ) -> dict:
+        y_true_segmentation = np.asarray(y_true_segmentation)
+        if y_true_segmentation.ndim == 1:
+            y_true_segmentation = y_true_segmentation.reshape(-1, 1)
+
+        seq_len = y_true_segmentation.shape[0]
+
+        true_det = Evaluator.segmentation_to_detections(y_true_segmentation.astype(np.float32))
+        true_intervals = Evaluator.detections_to_intervals(true_det, seq_len, confidence_threshold=1e-6)
+        true_intervals = Evaluator.intervals_nms(true_intervals, iou_threshold=1.0)
+
+        pred_intervals = Evaluator.detections_to_intervals(np.asarray(y_pred_detection), seq_len, confidence_threshold=confidence_threshold)
+        pred_intervals = Evaluator.intervals_nms(pred_intervals, iou_threshold=nms_iou_threshold)
+
+        tp, fp, fn = Evaluator._match_intervals(pred_intervals, true_intervals, iou_threshold=match_iou_threshold)
+        result = Evaluator._safe_prf(tp, fp, fn)
+        result["num_predicted_intervals"] = int(len(pred_intervals))
+        result["num_true_intervals"] = int(len(true_intervals))
+        return result
+
+    @staticmethod
+    def segmentation_metrics_from_arrays(
+        y_true_segmentation: np.ndarray,
+        y_pred_segmentation: np.ndarray,
+        threshold: float = 0.5,
+    ) -> dict:
+        y_true_segmentation = np.asarray(y_true_segmentation)
+        y_pred_segmentation = np.asarray(y_pred_segmentation)
+
+        if y_true_segmentation.ndim == 1:
+            y_true_segmentation = y_true_segmentation.reshape(-1, 1)
+        if y_pred_segmentation.ndim == 1:
+            y_pred_segmentation = y_pred_segmentation.reshape(-1, 1)
+
+        y_true_bin = y_true_segmentation.astype(np.int32)
+        y_pred_bin = (y_pred_segmentation > threshold).astype(np.int32)
+
+        tp = int(np.logical_and(y_true_bin == 1, y_pred_bin == 1).sum())
+        fp = int(np.logical_and(y_true_bin == 0, y_pred_bin == 1).sum())
+        fn = int(np.logical_and(y_true_bin == 1, y_pred_bin == 0).sum())
+        return Evaluator._safe_prf(tp, fp, fn)
+
+    @staticmethod
     def sigmoid_to_true_duration(y: np.ndarray, fsamp=250) -> np.ndarray:
         """
         Convert sigmoided variant to true duration.

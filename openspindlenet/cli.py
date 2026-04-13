@@ -1,283 +1,531 @@
-"""
-Command-line interface for OpenSpindleNet using Typer
-"""
+"""Command-line interface for OpenSpindleNet using Typer."""
+
+import csv
+import datetime
 import importlib.util
+import json
+import os
 import sys
 from pathlib import Path
-import os
-import datetime
+from typing import Optional
 
-# Check for optional CLI dependencies
+
 CLI_AVAILABLE = True
 MISSING_PACKAGES = []
-
-for package in ["typer", "rich"]:
+for package in ["typer", "rich", "tqdm"]:
     if importlib.util.find_spec(package) is None:
         CLI_AVAILABLE = False
         MISSING_PACKAGES.append(package)
 
+
 if not CLI_AVAILABLE:
     def main():
-        """Entry point for the CLI when dependencies are missing."""
         print("Error: OpenSpindleNet CLI dependencies are not installed.")
         print(f"Missing packages: {', '.join(MISSING_PACKAGES)}")
         print("\nTo use the CLI features, install the package with CLI extras:")
         print("    pip install openspindlenet[cli]")
         sys.exit(1)
 else:
-    import typer
+    import inspect
     import numpy as np
-    from typing import Optional
+    import typer
+    import click
     from rich.console import Console
-    from rich import print as rprint
+    from tqdm import tqdm
 
-    # Import from internal modules - note we use the renamed detect function
+    # Typer/Click compatibility:
+    # Some environments mix Typer with Click where make_metavar() requires ctx,
+    # while Typer rich help may call it without ctx.
+    _make_metavar_sig = inspect.signature(click.core.Parameter.make_metavar)
+    if "ctx" in _make_metavar_sig.parameters:
+        _orig_make_metavar = click.core.Parameter.make_metavar
+
+        def _compat_make_metavar(self, ctx=None):
+            if ctx is None:
+                ctx = click.get_current_context(silent=True)
+            if ctx is None:
+                ctx = click.Context(click.Command(name="openspindlenet"))
+            return _orig_make_metavar(self, ctx)
+
+        click.core.Parameter.make_metavar = _compat_make_metavar
+
     from . import detect
-    from . import get_model_path, get_example_data_path
+    from . import get_example_data_path, get_model_path
+    from .evaluator import Evaluator
     from .visualization import visualize_spindles
 
-    # Create Typer app with more specific help text
     app = typer.Typer(
-        help="OpenSpindleNet: Detect sleep spindles in EEG/iEEG data\n\n"
-             "Basic usage:\n"
-             "  spindle-detect detect <FILE_PATH>  # Detect spindles in a file\n"
-             "  spindle-detect example            # Run detection on example data\n"
-             "  spindle-detect info               # Show information about available models"
+        help=(
+            "OpenSpindleNet: Detect and evaluate sleep spindles in EEG/iEEG data\n\n"
+            "Examples:\n"
+            "  openspindlenet detect path/to/signal.txt --model-type eeg --visualize\n"
+            "  openspindlenet eval path/to/signal.txt path/to/labels.txt --visualize"
+        )
     )
     console = Console()
 
-    def generate_output_filename(prefix, suffix=None):
-        """Generate a timestamped output filename."""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if suffix:
-            return f"{prefix}_{timestamp}_{suffix}.pdf"
-        return f"{prefix}_{timestamp}.pdf"
+    def _timestamp() -> str:
+        return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _auto_output_path(prefix: str, suffix: str, stem: str) -> Path:
+        return Path(f"{prefix}_{stem}_{_timestamp()}.{suffix}")
+
+    def _load_signal(path: Path) -> np.ndarray:
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        data = np.loadtxt(path, dtype=np.float32)
+        if data.ndim != 1:
+            data = data.reshape(-1)
+        return data
+
+    def _load_labels(path: Path) -> np.ndarray:
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        labels = np.loadtxt(path, dtype=np.float32)
+        if labels.ndim != 1:
+            labels = labels.reshape(-1)
+        return labels
+
+    def _pred_segmentation(results: dict, seq_len: int, threshold: float) -> np.ndarray:
+        seg = results.get("segmentation", np.zeros((seq_len, 1), dtype=np.float32))
+        seg = np.asarray(seg)
+        if seg.ndim == 2:
+            seg = seg[:, 0]
+        return (seg > threshold).astype(np.float32)
+
+    def _mean_std(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        arr = np.asarray(values, dtype=np.float64)
+        return float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+
+    def _prf_from_counts(tp: int, fp: int, fn: int) -> dict:
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        return {
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        }
+
+    def _collect_eval_pairs(signal_dir: Path, labels_dir: Path) -> list[tuple[Path, Path, str]]:
+        signal_files = sorted(signal_dir.glob("*.txt"))
+        if not signal_files:
+            raise ValueError(f"No .txt files found in signal directory: {signal_dir}")
+
+        pairs: list[tuple[Path, Path, str]] = []
+        missing_labels: list[str] = []
+        for signal_path in signal_files:
+            label_path = labels_dir / signal_path.name
+            if not label_path.exists():
+                missing_labels.append(signal_path.name)
+                continue
+            pairs.append((signal_path, label_path, signal_path.stem))
+
+        if missing_labels:
+            raise ValueError(
+                "Missing label files for signals: " + ", ".join(missing_labels[:10])
+                + (" ..." if len(missing_labels) > 10 else "")
+            )
+
+        return pairs
+
+    def _build_dir_summary(per_file_rows: list[dict], model_type: str, thresholds: dict) -> dict:
+        det_p = [float(r["det_precision"]) for r in per_file_rows]
+        det_r = [float(r["det_recall"]) for r in per_file_rows]
+        det_f = [float(r["det_f1"]) for r in per_file_rows]
+        seg_p = [float(r["seg_precision"]) for r in per_file_rows]
+        seg_r = [float(r["seg_recall"]) for r in per_file_rows]
+        seg_f = [float(r["seg_f1"]) for r in per_file_rows]
+
+        det_tp = int(sum(int(r["det_tp"]) for r in per_file_rows))
+        det_fp = int(sum(int(r["det_fp"]) for r in per_file_rows))
+        det_fn = int(sum(int(r["det_fn"]) for r in per_file_rows))
+        seg_tp = int(sum(int(r["seg_tp"]) for r in per_file_rows))
+        seg_fp = int(sum(int(r["seg_fp"]) for r in per_file_rows))
+        seg_fn = int(sum(int(r["seg_fn"]) for r in per_file_rows))
+
+        det_macro_p = _mean_std(det_p)
+        det_macro_r = _mean_std(det_r)
+        det_macro_f = _mean_std(det_f)
+        seg_macro_p = _mean_std(seg_p)
+        seg_macro_r = _mean_std(seg_r)
+        seg_macro_f = _mean_std(seg_f)
+
+        return {
+            "num_files": int(len(per_file_rows)),
+            "model_type": model_type,
+            "thresholds": thresholds,
+            "detection": {
+                "macro": {
+                    "precision_mean": det_macro_p[0],
+                    "precision_std": det_macro_p[1],
+                    "recall_mean": det_macro_r[0],
+                    "recall_std": det_macro_r[1],
+                    "f1_mean": det_macro_f[0],
+                    "f1_std": det_macro_f[1],
+                },
+                "micro": _prf_from_counts(det_tp, det_fp, det_fn),
+                "counts": {"tp": det_tp, "fp": det_fp, "fn": det_fn},
+            },
+            "segmentation": {
+                "macro": {
+                    "precision_mean": seg_macro_p[0],
+                    "precision_std": seg_macro_p[1],
+                    "recall_mean": seg_macro_r[0],
+                    "recall_std": seg_macro_r[1],
+                    "f1_mean": seg_macro_f[0],
+                    "f1_std": seg_macro_f[1],
+                },
+                "micro": _prf_from_counts(seg_tp, seg_fp, seg_fn),
+                "counts": {"tp": seg_tp, "fp": seg_fp, "fn": seg_fn},
+            },
+        }
 
     @app.command("detect")
     def detect_cmd(
-        input_file: Path = typer.Argument(..., help="Path to input EEG data file"),
-        model_type: str = typer.Option("eeg", help="Model type to use: 'eeg' or 'ieeg'"),
-        output_file: Optional[Path] = typer.Option(None, help="Path to save detection results"),
-        visualization_file: Optional[Path] = typer.Option(None, help="Path to save visualization PDF (default: auto-generated)"),
-        visualize: bool = typer.Option(False, "--visualize/--no-visualize", help="Visualize the detection results"),
-        threshold: float = typer.Option(0.5, help="Confidence threshold for detections"),
-        nms_threshold: float = typer.Option(0.3, help="Non-maximum suppression IoU threshold"),
+        input_file: Path = typer.Argument(..., help="Path to input EEG/iEEG TXT file"),
+        model_type: str = typer.Option("eeg", help="Model type: eeg or ieeg"),
+        output_file: Optional[Path] = typer.Option(None, help="Optional output TXT with detection intervals"),
+        visualization_file: Optional[Path] = typer.Option(None, help="Optional output PDF path"),
+        visualize: bool = typer.Option(False, "--visualize/--no-visualize", help="Generate PDF visualization"),
+        confidence_threshold: float = typer.Option(0.5, help="Confidence threshold for detections"),
+        nms_iou_threshold: float = typer.Option(0.3, help="NMS IoU threshold"),
     ):
-        """Detect sleep spindles in EEG/iEEG data file."""
+        """Detect spindles in a single signal file."""
         try:
-            # Check if user might have intended to use the example command
-            if str(input_file) == "example":
-                console.print("[bold yellow]Did you mean to use the example command?[/bold yellow]")
-                console.print("Try: spindle-detect example")
-                raise typer.Exit(code=1)
-                
-            # Load data
-            console.print(f"Loading data from [bold]{input_file}[/bold]...")
-            try:
-                if not input_file.exists():
-                    console.print(f"[bold red]Error:[/bold red] File '{input_file}' does not exist")
-                    raise typer.Exit(code=1)
-                data = np.loadtxt(input_file)
-            except Exception as e:
-                console.print(f"[bold red]Error loading data:[/bold red] {str(e)}")
-                raise typer.Exit(code=1)
-            
-            # Detect spindles
-            console.print(f"Detecting spindles using [bold]{model_type}[/bold] model...")
-            try:
-                results = detect(data, model_type=model_type)
-            except Exception as e:
-                console.print(f"[bold red]Error during detection:[/bold red] {str(e)}")
-                raise typer.Exit(code=1)
-            
-            # Output results
-            intervals = results["detection_intervals"]
-            console.print(f"[bold green]Found {len(intervals)} spindle(s)[/bold green]")
-            
+            data = _load_signal(input_file)
+            results = detect(
+                data,
+                model_type=model_type,
+                confidence_threshold=confidence_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+            )
+            intervals = np.asarray(results.get("detection_intervals", []))
+            console.print(f"[bold green]Detected {len(intervals)} spindle(s).[/bold green]")
+
             if output_file:
-                # Save results
-                np.savetxt(output_file, intervals, fmt='%.2f', header='start end')
-                console.print(f"Results saved to [bold]{output_file}[/bold]")
-            
-            # Print results to console
-            if len(intervals) > 0:
-                console.print("Spindle intervals (seconds):")
-                # Print each interval - safely handle both [start, end] and [start, end, confidence] formats
-                for i, interval in enumerate(intervals):
-                    if len(interval) >= 2:  # Make sure we have at least start and end
-                        start, end = interval[0], interval[1]
-                        console.print(f"  {i+1}. {start:.2f} - {end:.2f} (duration: {end-start:.2f}s)")
-            
-            # Visualize if requested
+                header = "start end confidence"
+                np.savetxt(output_file, intervals, fmt="%.6f", header=header)
+                console.print(f"Saved intervals to [bold]{output_file}[/bold]")
+
+            for i, interval in enumerate(intervals):
+                start, end = float(interval[0]), float(interval[1])
+                conf = float(interval[2]) if len(interval) >= 3 else float("nan")
+                console.print(f"  {i + 1}. start={start:.1f}, end={end:.1f}, conf={conf:.3f}")
+
             if visualize:
-                console.print("Generating visualization...")
-                
-                # Auto-generate visualization filename if not provided
-                if visualization_file is None:
-                    input_stem = Path(input_file).stem
-                    visualization_file = Path(generate_output_filename(f"spindles_{input_stem}"))
-                
-                # Create a simple segmentation mask for visualization
-                # (1 for detected spindle segments, 0 elsewhere)
-                segmentation = np.zeros(len(data))
-                
-                # Be careful with array indexing - handle both empty arrays and different dimensions
-                if len(intervals) > 0:
-                    # Handle different array shapes
-                    if intervals.ndim == 1 and len(intervals) >= 2:
-                        # Single interval as a 1D array
-                        start_idx, end_idx = int(intervals[0]), int(intervals[1])
-                        segmentation[start_idx:end_idx+1] = 1
-                    elif intervals.ndim == 2:
-                        # Multiple intervals as a 2D array
-                        for interval in intervals:
-                            if len(interval) >= 2:
-                                start_idx, end_idx = int(interval[0]), int(interval[1])
-                                segmentation[start_idx:end_idx+1] = 1
-                
-                try:
-                    # Use absolute path for visualization file to ensure it's saved in the current directory
-                    abs_vis_path = os.path.abspath(visualization_file)
-                    
-                    # Always create visualization, even with no spindles
-                    visualize_spindles(data, intervals, segmentation, output_path=abs_vis_path)
-                    
-                    # Print both relative (user-friendly) and absolute paths
-                    rel_path = os.path.relpath(abs_vis_path)
-                    console.print(f"[bold green]Visualization saved to:[/bold green] {rel_path}")
-                    console.print(f"[dim]Full path: {abs_vis_path}[/dim]")
-                except Exception as e:
-                    console.print(f"[bold yellow]Warning:[/bold yellow] Visualization failed: {str(e)}")
-            
+                out_pdf = visualization_file or _auto_output_path("detect", "pdf", input_file.stem)
+                pred_seg = _pred_segmentation(results, len(data), threshold=0.5)
+                visualize_spindles(
+                    signal=data,
+                    intervals=intervals,
+                    segmentation=pred_seg,
+                    output_path=str(out_pdf),
+                )
+                console.print(f"Saved visualization to [bold]{out_pdf}[/bold]")
         except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
+    @app.command("eval")
+    def eval_cmd(
+        signal_file: Path = typer.Argument(..., help="Path to signal TXT file"),
+        labels_file: Path = typer.Argument(..., help="Path to labels TXT file"),
+        model_type: str = typer.Option("eeg", help="Model type: eeg or ieeg"),
+        output_dir: Optional[Path] = typer.Option(None, help="Output directory for directory-mode evaluation"),
+        output_json: Optional[Path] = typer.Option(None, help="Optional output JSON path"),
+        output_csv: Optional[Path] = typer.Option(None, help="Optional output CSV path"),
+        visualization_file: Optional[Path] = typer.Option(None, help="Optional output PDF path"),
+        visualize: bool = typer.Option(False, "--visualize/--no-visualize", help="Generate PDF with predictions, labels, and metrics"),
+        confidence_threshold: float = typer.Option(0.5, help="Detection confidence threshold"),
+        nms_iou_threshold: float = typer.Option(0.3, help="Detection NMS IoU threshold"),
+        match_iou_threshold: float = typer.Option(0.3, help="Interval match IoU threshold"),
+        segmentation_threshold: float = typer.Option(0.5, help="Segmentation threshold"),
+    ):
+        """Evaluate predictions against label segmentation for one signal."""
+        try:
+            if signal_file.is_dir() or labels_file.is_dir():
+                if not signal_file.is_dir() or not labels_file.is_dir():
+                    raise ValueError("Directory-mode eval requires both SIGNAL and LABELS arguments to be directories")
+
+                pairs = _collect_eval_pairs(signal_file, labels_file)
+                out_dir = output_dir or Path(f"eval_dir_{signal_file.name}_{_timestamp()}")
+                vis_dir = out_dir / "visualizations"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                vis_dir.mkdir(parents=True, exist_ok=True)
+
+                per_file_rows: list[dict] = []
+                thresholds = {
+                    "confidence_threshold": confidence_threshold,
+                    "nms_iou_threshold": nms_iou_threshold,
+                    "match_iou_threshold": match_iou_threshold,
+                    "segmentation_threshold": segmentation_threshold,
+                }
+
+                console.print(f"[bold]Directory evaluation:[/bold] {len(pairs)} files")
+                for signal_path, label_path, sample_id in tqdm(pairs, desc="Evaluating files", unit="file"):
+                    signal = _load_signal(signal_path)
+                    labels = _load_labels(label_path)
+                    if len(signal) != len(labels):
+                        raise ValueError(
+                            f"Length mismatch in {sample_id}: signal={len(signal)}, labels={len(labels)}"
+                        )
+
+                    results = detect(
+                        signal,
+                        model_type=model_type,
+                        labels=labels,
+                        confidence_threshold=confidence_threshold,
+                        nms_iou_threshold=nms_iou_threshold,
+                        match_iou_threshold=match_iou_threshold,
+                        segmentation_threshold=segmentation_threshold,
+                    )
+
+                    intervals = np.asarray(results.get("detection_intervals", []))
+                    metrics = results.get("metrics", {})
+                    det = metrics.get("detection", {})
+                    seg = metrics.get("segmentation", {})
+
+                    per_file_rows.append(
+                        {
+                            "sample_id": sample_id,
+                            "signal_file": str(signal_path),
+                            "labels_file": str(label_path),
+                            "model_type": model_type,
+                            "num_predicted_intervals": int(len(intervals)),
+                            "det_tp": int(det.get("tp", 0)),
+                            "det_fp": int(det.get("fp", 0)),
+                            "det_fn": int(det.get("fn", 0)),
+                            "det_precision": float(det.get("precision", 0.0)),
+                            "det_recall": float(det.get("recall", 0.0)),
+                            "det_f1": float(det.get("f1", 0.0)),
+                            "seg_tp": int(seg.get("tp", 0)),
+                            "seg_fp": int(seg.get("fp", 0)),
+                            "seg_fn": int(seg.get("fn", 0)),
+                            "seg_precision": float(seg.get("precision", 0.0)),
+                            "seg_recall": float(seg.get("recall", 0.0)),
+                            "seg_f1": float(seg.get("f1", 0.0)),
+                        }
+                    )
+
+                    # Directory-mode always writes per-file visualizations into visualizations/.
+                    out_pdf = vis_dir / f"{sample_id}.pdf"
+                    pred_seg = _pred_segmentation(results, len(signal), threshold=segmentation_threshold)
+                    true_seg = labels.astype(np.float32)
+                    visualize_spindles(
+                        signal=signal,
+                        intervals=intervals,
+                        segmentation=pred_seg,
+                        output_path=str(out_pdf),
+                        true_segmentation=true_seg,
+                        metrics=metrics,
+                        title=f"Evaluation: {sample_id}",
+                        close_figure=True,
+                    )
+
+                summary = _build_dir_summary(per_file_rows, model_type=model_type, thresholds=thresholds)
+
+                out_csv = out_dir / "per_file_results.csv"
+                out_json = out_dir / "summary.json"
+
+                with open(out_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(per_file_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(per_file_rows)
+
+                with open(out_json, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2)
+
+                det_micro = summary["detection"]["micro"]
+                seg_micro = summary["segmentation"]["micro"]
+                console.print("[bold green]Directory evaluation complete.[/bold green]")
+                console.print(
+                    "Detection micro: "
+                    f"P={det_micro['precision']:.4f} "
+                    f"R={det_micro['recall']:.4f} "
+                    f"F1={det_micro['f1']:.4f}"
+                )
+                console.print(
+                    "Segmentation micro: "
+                    f"P={seg_micro['precision']:.4f} "
+                    f"R={seg_micro['recall']:.4f} "
+                    f"F1={seg_micro['f1']:.4f}"
+                )
+                console.print(f"Saved per-file CSV to [bold]{out_csv}[/bold]")
+                console.print(f"Saved summary JSON to [bold]{out_json}[/bold]")
+                console.print(f"Saved per-file PDFs to [bold]{vis_dir}[/bold]")
+                return
+
+            signal = _load_signal(signal_file)
+            labels = _load_labels(labels_file)
+            if len(signal) != len(labels):
+                raise ValueError(f"Signal length ({len(signal)}) and labels length ({len(labels)}) must match")
+
+            results = detect(
+                signal,
+                model_type=model_type,
+                labels=labels,
+                confidence_threshold=confidence_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                match_iou_threshold=match_iou_threshold,
+                segmentation_threshold=segmentation_threshold,
+            )
+
+            intervals = np.asarray(results.get("detection_intervals", []))
+            metrics = results.get("metrics", {})
+            det = metrics.get("detection", {})
+            seg = metrics.get("segmentation", {})
+
+            console.print("[bold green]Evaluation complete.[/bold green]")
+            console.print(
+                "Detection: "
+                f"P={det.get('precision', 0.0):.4f} "
+                f"R={det.get('recall', 0.0):.4f} "
+                f"F1={det.get('f1', 0.0):.4f} "
+                f"(TP={det.get('tp', 0)}, FP={det.get('fp', 0)}, FN={det.get('fn', 0)})"
+            )
+            console.print(
+                "Segmentation: "
+                f"P={seg.get('precision', 0.0):.4f} "
+                f"R={seg.get('recall', 0.0):.4f} "
+                f"F1={seg.get('f1', 0.0):.4f} "
+                f"(TP={seg.get('tp', 0)}, FP={seg.get('fp', 0)}, FN={seg.get('fn', 0)})"
+            )
+
+            out_json = output_json or _auto_output_path("eval", "json", signal_file.stem)
+            out_csv = output_csv or _auto_output_path("eval", "csv", signal_file.stem)
+
+            json_payload = {
+                "signal_file": str(signal_file),
+                "labels_file": str(labels_file),
+                "model_type": model_type,
+                "thresholds": {
+                    "confidence_threshold": confidence_threshold,
+                    "nms_iou_threshold": nms_iou_threshold,
+                    "match_iou_threshold": match_iou_threshold,
+                    "segmentation_threshold": segmentation_threshold,
+                },
+                "num_predicted_intervals": int(len(intervals)),
+                "metrics": metrics,
+                "detection_intervals": intervals.tolist(),
+            }
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(json_payload, f, indent=2)
+
+            csv_row = {
+                "signal_file": str(signal_file),
+                "labels_file": str(labels_file),
+                "model_type": model_type,
+                "num_predicted_intervals": int(len(intervals)),
+                "det_tp": int(det.get("tp", 0)),
+                "det_fp": int(det.get("fp", 0)),
+                "det_fn": int(det.get("fn", 0)),
+                "det_precision": float(det.get("precision", 0.0)),
+                "det_recall": float(det.get("recall", 0.0)),
+                "det_f1": float(det.get("f1", 0.0)),
+                "seg_tp": int(seg.get("tp", 0)),
+                "seg_fp": int(seg.get("fp", 0)),
+                "seg_fn": int(seg.get("fn", 0)),
+                "seg_precision": float(seg.get("precision", 0.0)),
+                "seg_recall": float(seg.get("recall", 0.0)),
+                "seg_f1": float(seg.get("f1", 0.0)),
+            }
+            with open(out_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(csv_row.keys()))
+                writer.writeheader()
+                writer.writerow(csv_row)
+
+            console.print(f"Saved JSON to [bold]{out_json}[/bold]")
+            console.print(f"Saved CSV to [bold]{out_csv}[/bold]")
+
+            if visualize:
+                out_pdf = visualization_file or _auto_output_path("eval", "pdf", signal_file.stem)
+                pred_seg = _pred_segmentation(results, len(signal), threshold=segmentation_threshold)
+                true_seg = labels.astype(np.float32)
+                visualize_spindles(
+                    signal=signal,
+                    intervals=intervals,
+                    segmentation=pred_seg,
+                    output_path=str(out_pdf),
+                    true_segmentation=true_seg,
+                    metrics=metrics,
+                    title=f"Evaluation: {signal_file.name}",
+                )
+                console.print(f"Saved visualization to [bold]{out_pdf}[/bold]")
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
             raise typer.Exit(code=1)
 
     @app.command("info")
     def info():
-        """Display information about OpenSpindleNet."""
-        console.print("[bold]OpenSpindleNet: Sleep Spindle Detection Tool[/bold]")
+        """Display information about OpenSpindleNet models and examples."""
+        console.print("[bold]OpenSpindleNet[/bold]")
         console.print("\n[bold]Available models:[/bold]")
-        
+
         try:
-            eeg_model_path = get_model_path("eeg")
-            console.print(f"  - EEG model: [green]{eeg_model_path}[/green]")
-        except:
-            console.print("  - EEG model: [red]Not found[/red]")
-        
+            console.print(f"  - EEG: [green]{get_model_path('eeg')}[/green]")
+        except Exception:
+            console.print("  - EEG: [red]Not found[/red]")
+
         try:
-            ieeg_model_path = get_model_path("ieeg")
-            console.print(f"  - iEEG model: [green]{ieeg_model_path}[/green]")
-        except:
-            console.print("  - iEEG model: [red]Not found[/red]")
-        
+            console.print(f"  - iEEG: [green]{get_model_path('ieeg')}[/green]")
+        except Exception:
+            console.print("  - iEEG: [red]Not found[/red]")
+
         console.print("\n[bold]Example data:[/bold]")
         try:
-            eeg_data_path = get_example_data_path("eeg")
-            console.print(f"  - EEG example: [green]{eeg_data_path}[/green]")
-        except:
-            console.print("  - EEG example: [red]Not found[/red]")
-        
+            console.print(f"  - EEG: [green]{get_example_data_path('eeg')}[/green]")
+        except Exception:
+            console.print("  - EEG: [red]Not found[/red]")
+
         try:
-            ieeg_data_path = get_example_data_path("ieeg")
-            console.print(f"  - iEEG example: [green]{ieeg_data_path}[/green]")
-        except:
-            console.print("  - iEEG example: [red]Not found[/red]")
-        
-        # Show usage examples at the end
+            console.print(f"  - iEEG: [green]{get_example_data_path('ieeg')}[/green]")
+        except Exception:
+            console.print("  - iEEG: [red]Not found[/red]")
+
         console.print("\n[bold]Usage examples:[/bold]")
-        console.print("  spindle-detect detect path/to/data.txt --model-type eeg")
-        console.print("  spindle-detect example --data-type eeg")
+        console.print("  openspindlenet detect path/to/signal.txt --model-type eeg")
+        console.print("  openspindlenet eval path/to/signal.txt path/to/labels.txt --visualize")
 
     @app.command("example")
     def run_example(
-        data_type: str = typer.Option("eeg", help="Type of example data to use: 'eeg' or 'ieeg'"),
-        visualization_file: Optional[Path] = typer.Option(None, help="Path to save visualization PDF (default: auto-generated)"),
-        visualize: bool = typer.Option(True, "--visualize/--no-visualize", help="Visualize the detection results"),
+        data_type: str = typer.Option("eeg", help="Example data type: eeg or ieeg"),
+        visualization_file: Optional[Path] = typer.Option(None, help="Optional output PDF path"),
+        visualize: bool = typer.Option(True, "--visualize/--no-visualize", help="Generate visualization"),
     ):
-        """Run spindle detection on example data."""
+        """Run spindle detection on packaged example data."""
         try:
-            # Get example data path
-            console.print(f"Loading example {data_type} data...")
-            try:
-                data_path = get_example_data_path(data_type)
-                data = np.loadtxt(data_path)
-            except Exception as e:
-                console.print(f"[bold red]Error loading example data:[/bold red] {str(e)}")
-                raise typer.Exit(code=1)
-            
-            # Detect spindles
-            console.print(f"Detecting spindles using {data_type} model...")
-            try:
-                results = detect(data, model_type=data_type)
-            except Exception as e:
-                console.print(f"[bold red]Error during detection:[/bold red] {str(e)}")
-                raise typer.Exit(code=1)
-            
-            # Output results
-            intervals = results["detection_intervals"]
-            console.print(f"[bold green]Found {len(intervals)} spindle(s)[/bold green]")
-            
-            # Print results to console
-            if len(intervals) > 0:
-                console.print("Spindle intervals (seconds):")
-                # Print each interval - safely handle both [start, end] and [start, end, confidence] formats
-                for i, interval in enumerate(intervals):
-                    if len(interval) >= 2:  # Make sure we have at least start and end
-                        start, end = interval[0], interval[1]
-                        
-                        # Convert start and end to seconds from time indices
-                        start_sec = start / 250  # Assuming 250 Hz sampling rate
-                        end_sec = end / 250
+            data_path = Path(get_example_data_path(data_type))
+            data = _load_signal(data_path)
+            results = detect(data, model_type=data_type)
+            intervals = np.asarray(results.get("detection_intervals", []))
 
-                        console.print(f"  {i+1}. {start_sec:.2f} - {end_sec:.2f} (duration: {end_sec-start_sec:.2f}s)")
+            console.print(f"[bold green]Detected {len(intervals)} spindle(s) in {data_type} example.[/bold green]")
+            for i, interval in enumerate(intervals):
+                start, end = float(interval[0]), float(interval[1])
+                conf = float(interval[2]) if len(interval) >= 3 else float("nan")
+                console.print(f"  {i + 1}. start={start:.1f}, end={end:.1f}, conf={conf:.3f}")
 
-            # Visualize if requested
             if visualize:
-                console.print("Generating visualization...")
-                
-                # Auto-generate visualization filename if not provided
-                if visualization_file is None:
-                    visualization_file = Path(generate_output_filename(f"spindles_example_{data_type}"))
-                
-                # Create a simple segmentation mask for visualization
-                # (1 for detected spindle segments, 0 elsewhere)
-                segmentation = np.zeros(len(data))
-                
-                # Be careful with array indexing - handle both empty arrays and different dimensions
-                if len(intervals) > 0:
-                    # Handle different array shapes
-                    if intervals.ndim == 1 and len(intervals) >= 2:
-                        # Single interval as a 1D array
-                        start_idx, end_idx = int(intervals[0]), int(intervals[1])
-                        segmentation[start_idx:end_idx+1] = 1
-                    elif intervals.ndim == 2:
-                        # Multiple intervals as a 2D array
-                        for interval in intervals:
-                            if len(interval) >= 2:
-                                start_idx, end_idx = int(interval[0]), int(interval[1])
-                                segmentation[start_idx:end_idx+1] = 1
-                
-                try:
-                    # Use absolute path for visualization file to ensure it's saved in the current directory
-                    abs_vis_path = os.path.abspath(visualization_file)
-                    
-                    # Always create visualization, even with no spindles
-                    visualize_spindles(data, intervals, segmentation, output_path=abs_vis_path)
-                    
-                    # Print both relative (user-friendly) and absolute paths
-                    rel_path = os.path.relpath(abs_vis_path)
-                    console.print(f"[bold green]Visualization saved to:[/bold green] {rel_path}")
-                    console.print(f"[dim]Full path: {abs_vis_path}[/dim]")
-                except Exception as e:
-                    console.print(f"[bold yellow]Warning:[/bold yellow] Visualization failed: {str(e)}")
-            
+                out_pdf = visualization_file or _auto_output_path("example", "pdf", data_type)
+                pred_seg = _pred_segmentation(results, len(data), threshold=0.5)
+                visualize_spindles(
+                    signal=data,
+                    intervals=intervals,
+                    segmentation=pred_seg,
+                    output_path=str(out_pdf),
+                )
+                console.print(f"Saved visualization to [bold]{out_pdf}[/bold]")
         except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(f"[bold red]Error:[/bold red] {e}")
             raise typer.Exit(code=1)
 
     def main():
-        """Entry point for the CLI."""
         app()
 
 if __name__ == "__main__":
