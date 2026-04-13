@@ -1,5 +1,7 @@
 """Command-line interface for OpenSpindleNet using Typer."""
 
+from __future__ import annotations
+
 import csv
 import datetime
 import importlib.util
