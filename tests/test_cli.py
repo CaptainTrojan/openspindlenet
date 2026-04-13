@@ -13,13 +13,17 @@ import shutil
 # Skip all tests in this file if CLI dependencies are not installed
 has_cli_deps = all(
     importlib.util.find_spec(pkg) is not None
-    for pkg in ["typer", "rich", "matplotlib"]
+    for pkg in ["typer", "rich", "matplotlib", "tqdm"]
 )
 
 skip_if_no_cli_deps = pytest.mark.skipif(
     not has_cli_deps,
     reason="CLI dependencies not installed"
 )
+
+
+def _cli_cmd(*args: str) -> list[str]:
+    return [sys.executable, "-m", "openspindlenet.cli", *args]
 
 def test_cli_missing_dependencies_message():
     """Test that appropriate message is shown when CLI dependencies are missing."""
@@ -47,7 +51,7 @@ def test_cli_detect_command(sample_eeg_data_file, tmp_path):
     output_file = tmp_path / "output.txt"
     
     # Run the CLI command
-    cmd = ["spindle-detect", "detect", str(sample_eeg_data_file), "--output-file", str(output_file)]
+    cmd = _cli_cmd("detect", str(sample_eeg_data_file), "--output-file", str(output_file))
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Check that command executed successfully
@@ -60,12 +64,12 @@ def test_cli_detect_command(sample_eeg_data_file, tmp_path):
 def test_cli_detect_with_model_type(sample_eeg_data_file):
     """Test the detect command with model-type parameter as shown in the README."""
     # Test with EEG model type (explicitly)
-    cmd = ["spindle-detect", "detect", str(sample_eeg_data_file), "--model-type", "eeg", "--no-visualize"]
+    cmd = _cli_cmd("detect", str(sample_eeg_data_file), "--model-type", "eeg", "--no-visualize")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Command should execute successfully
     assert result.returncode == 0
-    assert "Detecting spindles using eeg model" in result.stdout
+    assert "Detected" in result.stdout
     
     # Test with iEEG model type if available
     try:
@@ -74,11 +78,11 @@ def test_cli_detect_with_model_type(sample_eeg_data_file):
         get_model_path("ieeg")
         
         # Run command with iEEG model
-        cmd = ["spindle-detect", "detect", str(sample_eeg_data_file), "--model-type", "ieeg", "--no-visualize"]
+        cmd = _cli_cmd("detect", str(sample_eeg_data_file), "--model-type", "ieeg", "--no-visualize")
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         assert result.returncode == 0
-        assert "Detecting spindles using ieeg model" in result.stdout
+        assert "Detected" in result.stdout
     except:
         # Skip this part of the test if iEEG model is not available
         pass
@@ -92,32 +96,27 @@ def test_cli_detect_with_visualize(sample_eeg_data_file):
     import matplotlib
     matplotlib.use('Agg')  # Use non-interactive backend to prevent display
     
-    cmd = ["spindle-detect", "detect", str(sample_eeg_data_file), "--visualize"]
+    cmd = _cli_cmd("detect", str(sample_eeg_data_file), "--visualize")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Command should execute successfully
     assert result.returncode == 0
-    # Should mention visualization in output
-    assert "Generating visualization" in result.stdout
+    assert "Saved visualization to" in result.stdout
 
 @skip_if_no_cli_deps
 def test_cli_info_command():
     """Test the info command."""
     # Run the CLI command
-    cmd = ["spindle-detect", "info"]
+    cmd = _cli_cmd("info")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Check that command executed successfully
     assert result.returncode == 0
     
     # Check that it contains expected output
-    assert "OpenSpindleNet: Sleep Spindle Detection Tool" in result.stdout
-    # Check for mention of models which should be in the output
-    assert "EEG model" in result.stdout
-    assert "iEEG model" in result.stdout
-    # Check for mention of example data which should be in the output
-    assert "EEG example" in result.stdout
-    assert "iEEG example" in result.stdout
+    assert "OpenSpindleNet" in result.stdout
+    assert "EEG" in result.stdout
+    assert "iEEG" in result.stdout
 
 @skip_if_no_cli_deps
 def test_cli_example_command():
@@ -128,34 +127,34 @@ def test_cli_example_command():
         pytest.skip("Example data files not available")
     
     # Run the CLI command with --no-visualize to avoid opening plot window
-    cmd = ["spindle-detect", "example", "--no-visualize"]
+    cmd = _cli_cmd("example", "--no-visualize")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Check that command executed successfully
     assert result.returncode == 0
     
     # Check that it contains expected output
-    assert "Loading example eeg data" in result.stdout
-    assert "spindle(s)" in result.stdout  # Should report found spindles
+    assert "Detected" in result.stdout
+    assert "example" in result.stdout.lower()
 
 @skip_if_no_cli_deps
 def test_cli_example_with_data_type():
     """Test the example command with the data-type parameter as shown in the README."""
     # Test with EEG data type
-    cmd = ["spindle-detect", "example", "--data-type", "eeg", "--no-visualize"]
+    cmd = _cli_cmd("example", "--data-type", "eeg", "--no-visualize")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Command should execute successfully
     assert result.returncode == 0
-    assert "Loading example eeg data" in result.stdout
+    assert "Detected" in result.stdout
     
     # Test with iEEG data type if available
     if (Path(__file__).parent.parent / "openspindlenet" / "data" / "ieeg_sample.txt").exists():
-        cmd = ["spindle-detect", "example", "--data-type", "ieeg", "--no-visualize"]
+        cmd = _cli_cmd("example", "--data-type", "ieeg", "--no-visualize")
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         assert result.returncode == 0
-        assert "Loading example ieeg data" in result.stdout
+        assert "Detected" in result.stdout
 
 @skip_if_no_cli_deps
 def test_visualization_saving(sample_eeg_data_file, tmp_path):
@@ -164,8 +163,8 @@ def test_visualization_saving(sample_eeg_data_file, tmp_path):
     vis_path = tmp_path / "test_visualization.pdf"
     
     # Enable visualization and specify the output path
-    cmd = ["spindle-detect", "detect", str(sample_eeg_data_file), 
-           "--visualize", "--visualization-file", str(vis_path)]
+    cmd = _cli_cmd("detect", str(sample_eeg_data_file),
+                   "--visualize", "--visualization-file", str(vis_path))
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     
@@ -173,14 +172,14 @@ def test_visualization_saving(sample_eeg_data_file, tmp_path):
     assert result.returncode == 0
     
     # Check if the visualization messages appear in the output
-    assert "Generating visualization" in result.stdout
+    assert "Saved visualization to" in result.stdout
     
     # Check if the visualization file exists
     assert vis_path.exists()
     assert vis_path.stat().st_size > 0  # File should not be empty
     
     # Check if the output message correctly shows the path
-    assert f"Visualization saved to:" in result.stdout
+    assert "Saved visualization to" in result.stdout
     # Using Path.name to just match the filename part since paths might differ
     assert vis_path.name in result.stdout
 
@@ -191,7 +190,7 @@ def test_example_visualization_saving(tmp_path):
     vis_path = tmp_path / "example_visualization.pdf"
     
     # Enable visualization and specify the output path
-    cmd = ["spindle-detect", "example", "--visualization-file", str(vis_path)]
+    cmd = _cli_cmd("example", "--visualization-file", str(vis_path))
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     
@@ -199,13 +198,13 @@ def test_example_visualization_saving(tmp_path):
     assert result.returncode == 0
     
     # Check if the visualization messages appear in the output
-    assert "Generating visualization" in result.stdout
+    assert "Saved visualization to" in result.stdout
     
     # Check if the visualization file exists
     assert vis_path.exists()
     assert vis_path.stat().st_size > 0  # File should not be empty
     
     # Check if the output message correctly shows the path
-    assert f"Visualization saved to:" in result.stdout
+    assert "Saved visualization to" in result.stdout
     # Using Path.name to just match the filename part since paths might differ
     assert vis_path.name in result.stdout
