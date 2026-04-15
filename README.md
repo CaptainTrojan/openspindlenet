@@ -82,12 +82,13 @@ pytest tests/
 If you find our work useful, please cite our publication
 ```
 @article{sejak2025openspindlenet,
-  title={OpenSpindleNet: An Open-Source Deep Learning Network for Reliable Sleep Spindle Detection},
-  author={Sejak, Michal and Mivalt, Filip and Sladky, Vladimir and Vsiansky, Vit and Carvalho, Diego Zaquera and St. Louis, Erik and Worrell, Gregory and Kremen, Vaclav},
-  journal={medRxiv},
-  pages={2025--04},
+  title={OpenSpindleNet: An open-source deep learning network for reliable sleep spindle detection in scalp and intracranial EEG},
+  author={Sejak, Michal and Mivalt, Filip and Sladky, Vladimir and Vsiansky, Vit and Carvalho, Diego Z and Louis, Erik K St and Worrell, Gregory A and Kremen, Vaclav},
+  journal={Computers in Biology and Medicine},
+  volume={197},
+  pages={110854},
   year={2025},
-  publisher={Cold Spring Harbor Laboratory Press}
+  publisher={Elsevier}
 }
 ```
 
